@@ -11,7 +11,7 @@ from telebot.storage import StateMemoryStorage
 import json
 import os
 import random
-
+from sqlalchemy import BigInteger
 
 ###Создаем и заполняем базы данных###
 
@@ -49,9 +49,9 @@ class Person_action(Base):
 class Person(Base):
     __tablename__ = 'person'
     id = Column(Integer, primary_key=True, autoincrement=True)
-    telegram_id = Column(Integer, nullable=False, unique=True)
+    telegram_id = Column(BigInteger, nullable=False, unique=True)  # заменили Integer на BigInteger
     dictionary = relationship('Dictionary', back_populates='person')
-    person_action= relationship('Person_action', back_populates='person')
+    person_action = relationship('Person_action', back_populates='person')
 
     def __str__(self):
         return f'Dictionary: {self.id}, {self.telegram_id}'
@@ -498,6 +498,10 @@ def message_reply(message):
             user_progress[message.chat.id]['total'] += 1
     markup.add(*new_buttons)
     bot.send_message(message.chat.id, hint, reply_markup=markup)
+
+bot.add_custom_filter(custom_filters.StateFilter(bot))
+
+bot.infinity_polling(skip_pending=True)
 
 bot.add_custom_filter(custom_filters.StateFilter(bot))
 
