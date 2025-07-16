@@ -1,17 +1,13 @@
-from Create_DB import *
 from dotenv import load_dotenv
-from sqlalchemy import Column, Integer, String, ForeignKey
-from sqlalchemy import create_engine
-from sqlalchemy.orm import declarative_base
-from sqlalchemy.orm import relationship
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy import Column, Integer, String, ForeignKey, BigInteger, text, create_engine
+from sqlalchemy.orm import declarative_base, sessionmaker, relationship
 from telebot import types, TeleBot, custom_filters
 from telebot.handler_backends import State, StatesGroup
 from telebot.storage import StateMemoryStorage
 import json
 import os
 import random
-from sqlalchemy import BigInteger
+
 
 ###Создаем и заполняем базы данных###
 
@@ -24,9 +20,7 @@ class Dictionary(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     word = Column(String, nullable=False)
     translation = Column(String, nullable=False)
-    person_id = Column(Integer, ForeignKey('person.id'))
     complexity = Column(String, nullable=False)
-    person = relationship('Person', back_populates='dictionary')
 
     def __str__(self):
         return f'Dictionary: {self.id}, {self.word}, {self.translation}, {self.person_id}, {self.complexity}'
@@ -35,11 +29,11 @@ class Dictionary(Base):
 class Person_action(Base):
     __tablename__ = 'person_action'
     id = Column(Integer, primary_key=True, autoincrement=True)
-    person_id = Column(Integer, ForeignKey('person.id'))
+    person_id = Column(Integer, ForeignKey('person.id'), nullable=False)  # <-- ForeignKey!
     word = Column(String, nullable=False)
     translation = Column(String, nullable=False)
     complexity = Column(String, nullable=False)
-    action = Column(String, nullable=False)
+    action = Column(String, nullable=False)  # 'add' или 'dell'
     person = relationship('Person', back_populates='person_action')
 
     def __str__(self):
@@ -49,8 +43,7 @@ class Person_action(Base):
 class Person(Base):
     __tablename__ = 'person'
     id = Column(Integer, primary_key=True, autoincrement=True)
-    telegram_id = Column(BigInteger, nullable=False, unique=True)  # заменили Integer на BigInteger
-    dictionary = relationship('Dictionary', back_populates='person')
+    telegram_id = Column(BigInteger, nullable=False, unique=True)
     person_action = relationship('Person_action', back_populates='person')
 
     def __str__(self):
@@ -101,8 +94,6 @@ state_storage = StateMemoryStorage()
 TOKEN_BOT = os.getenv('TOKEN_BOT')
 bot = TeleBot(TOKEN_BOT, state_storage=state_storage)
 os.getenv('DB_USER')
-
-
 known_users = []
 user_mode = {}  # {telegram_id: 10 | 50 | 100}
 user_progress = {}  # {telegram_id: {'total': 0, 'correct': 0}}
@@ -129,37 +120,6 @@ def show_hint(*lines):
 def show_target(data):
     return f"{data['target_word']} -> {data['translate_word']}"
 
-def get_user_words(session, telegram_id):
-    """
-    Возвращает список слов, доступных пользователю:
-    - фильтрация по сложности
-    """
-    person = session.query(Person).filter_by(telegram_id=telegram_id).first()
-    if not person:
-        return []
-    person_id = person.id
-    user_complexity = user_level.get(telegram_id, 'easy')  # по умолчанию easy
-    added = session.query(Person_action).filter_by(person_id=person_id, action='add').all()
-    deleted = session.query(Person_action).filter_by(person_id=person_id, action='dell').all()
-    deleted_set = {(d.word.strip().lower(), d.translation.strip().lower(), d.complexity.strip().lower()) for d in deleted}
-    all_words = session.query(Dictionary).filter_by(complexity=user_complexity).all()
-    result_words = []
-    for w in all_words:
-        key = (w.word.strip().lower(), w.translation.strip().lower(), w.complexity.strip().lower())
-        if key not in deleted_set:
-            result_words.append(w)
-    for a in added:
-        key = (a.word.strip().lower(), a.translation.strip().lower(), a.complexity.strip().lower())
-        if key not in deleted_set and a.complexity == user_complexity:
-            fake_dict = Dictionary(
-                word=a.word,
-                translation=a.translation,
-                complexity=a.complexity,
-                person_id=a.person_id
-            )
-            result_words.append(fake_dict)
-    return result_words
-
 def show_main_menu(message):
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
     start_btn = types.KeyboardButton('▶️ Начать')
@@ -175,6 +135,7 @@ def show_main_menu(message):
         reply_markup=markup
     )
 
+###ХЭНДЛЕРЫ###
 
 @bot.message_handler(func=lambda message: message.text == '🎯 Режим')
 def choose_mode(message):
@@ -224,7 +185,6 @@ def save_level(message):
         f"✅ Выбран уровень сложности: {message.text}.",
     )
     show_main_menu(message)
-
 
 @bot.message_handler(commands=['start'])
 def start_handler(message):
@@ -288,7 +248,6 @@ def create_cards(message):
     engine = create_engine(DSN)
     Session = sessionmaker(bind=engine)
     session = Session()
-
     existing_user = session.query(Person).filter_by(telegram_id=message.chat.id).first()
     global buttons
     buttons = []
@@ -298,7 +257,6 @@ def create_cards(message):
         markup.add(level_btn)
         bot.send_message(cid, "Сначала выбери уровень сложности:", reply_markup=markup)
         return
-    user_words = get_user_words(session, telegram_id=cid)
     total = user_mode.get(cid, 10)
     if cid not in user_progress:
         user_progress[cid] = {'total': 0, 'correct': 0}
@@ -321,26 +279,34 @@ def create_cards(message):
             reply_markup=markup
         )
         return
-    translations = [word.translation for word in user_words]
-    words = [word.word for word in user_words]
-    target_word = random.choice(translations)
-    translate = session.query(Dictionary).filter(Dictionary.translation == target_word).first().word
-    target_word_btn = types.KeyboardButton(target_word)
-    buttons.append(target_word_btn)
-    others = random.sample(translations, k=4)  # брать из БД
-    other_words_btns = [types.KeyboardButton(word) for word in others]
-    buttons.extend(other_words_btns)
+
+    query = text("""
+        SELECT word, translation FROM (
+            SELECT word, translation FROM dictionary WHERE complexity = :complexity
+            UNION
+            SELECT word, translation FROM person_action
+            WHERE person_id = :person_id AND action = 'add' AND complexity = :complexity
+        ) AS combined_words
+        ORDER BY RANDOM()
+        LIMIT 4
+    """)
+    person = session.query(Person).filter_by(telegram_id=cid).first()
+    result = session.execute(query, {'person_id': person.id, 'complexity': user_level[cid]}).fetchall()
+    correct_card = random.choice(result)
+
+    buttons = [types.KeyboardButton(row.translation) for row in result]
     random.shuffle(buttons)
-    next_btn = types.KeyboardButton(Command.NEXT)
-    buttons.extend([next_btn])
+    buttons.append(types.KeyboardButton(Command.NEXT))
     markup.add(*buttons)
-    greeting = f"Выбери перевод слова:\n🇷🇺 {translate}"
-    bot.send_message(message.chat.id, greeting, reply_markup=markup)
-    bot.set_state(message.from_user.id, MyStates.target_word, message.chat.id)
-    with bot.retrieve_data(message.from_user.id, message.chat.id) as data:
-        data['target_word'] = target_word
-        data['translate_word'] = translate
-        data['other_words'] = others
+    greeting = f"Выбери перевод слова:\n🇷🇺 {correct_card.word}"
+    bot.send_message(cid, greeting, reply_markup=markup)
+    # Сохраняем данные в состоянии для проверки ответа
+    bot.set_state(message.from_user.id, MyStates.target_word, cid)
+    with bot.retrieve_data(message.from_user.id, cid) as data:
+        data['target_word'] = correct_card.translation
+        data['translate_word'] = correct_card.word
+        data['other_translations'] = [row.translation for row in result if row.translation != correct_card.translation]
+    session.close()
 
 @bot.message_handler(func=lambda message: message.text == Command.NEXT)
 def next_cards(message):
@@ -369,7 +335,7 @@ def dell_word(message):
     # Получаем id пользователя
     id_to_add = session.query(Person.id).filter(Person.telegram_id == int(message.chat.id)).one()
     p_id = id_to_add[0]
-    # Ищем слово в словаре
+    # ПРОВЕРЯЕМ, СУЩЕСТВУЕТ ЛИ ВООБЩЕ В СЛОВАРЕ СЛОВО, КОТОРОЕ ХОЧЕТ УДАЛИТЬ ПОЛЬЗОВАТЕЛЬ, ПОСЛЕ - ДОБАВЛЯЕМ ЕГО В PERSON_ACTION С ПОМЕТКОЙ DELL
     word_entry = session.query(Dictionary).filter(Dictionary.word.ilike(word_input)).first()
     if word_entry:
         if word_entry:
@@ -381,7 +347,6 @@ def dell_word(message):
                 complexity=word_entry.complexity,
                 action='dell'
             ).first()
-
             if already_deleted:
                 bot.send_message(
                     message.chat.id,
@@ -406,6 +371,7 @@ def dell_word(message):
         print(f'{new_pair} добавлено в базу как удалённое слово.')
     else:
         bot.send_message(message.chat.id, "⚠️ Такое слово не найдено в словаре.")
+
 
 @bot.message_handler(func=lambda message: message.text == Command.ADD_WORD)
 def add_word(message):
@@ -477,9 +443,12 @@ def message_reply(message):
     text = message.text
     markup = types.ReplyKeyboardMarkup(row_width=2)
     new_buttons = []
+
     with bot.retrieve_data(message.from_user.id, message.chat.id) as data:
         target_word = data['target_word']
         if text == target_word:
+            # Правильный ответ — сбрасываем флаг ошибки
+            data['made_mistake'] = False
             user_answered_correctly[message.chat.id] = True
             hint = show_target(data)
             hint_text = ["Отлично!❤", hint]
@@ -489,19 +458,16 @@ def message_reply(message):
             user_progress[message.chat.id]['correct'] += 1
             user_progress[message.chat.id]['total'] += 1
         else:
-            for btn in new_buttons:
-                if btn.text == text:
-                    btn.text = text + '❌'
-                    break
-            hint = show_hint("Допущена ошибка!",
-                             f"Попробуй ещё раз вспомнить слово 🇷🇺{data['translate_word']}")
-            user_progress[message.chat.id]['total'] += 1
+            # Неправильный ответ — учитываем ошибку только один раз
+            if not data.get('made_mistake', False):
+                data['made_mistake'] = True
+                user_progress[message.chat.id]['correct'] -= 1
+            hint = show_hint(
+                "Допущена ошибка!",
+                f"Попробуй ещё раз вспомнить слово 🇷🇺{data['translate_word']}"
+            )
     markup.add(*new_buttons)
     bot.send_message(message.chat.id, hint, reply_markup=markup)
-
-bot.add_custom_filter(custom_filters.StateFilter(bot))
-
-bot.infinity_polling(skip_pending=True)
 
 bot.add_custom_filter(custom_filters.StateFilter(bot))
 
